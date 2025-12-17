@@ -133,6 +133,15 @@ public:
         : nbThreads(nbThreads), nbBlocksPerRow(nbBlocksPerRow)
     {
         // TODO
+        for (int x = 0; x < nbThreads;++x) {
+            PcoThreads([this]{
+            while (!ThreadsStop) {
+
+                buf.getjob();
+
+            }
+            });
+        }
     }
 
     ///
@@ -143,6 +152,7 @@ public:
     ~ThreadedMatrixMultiplier()
     {
         // TODO
+        ThreadsStop = true;
     }
 
     ///
@@ -185,6 +195,8 @@ public:
 protected:
     int nbThreads;
     int nbBlocksPerRow;
+    Buffer<T> buf;
+    bool ThreadsStop = false;
 };
 
 
