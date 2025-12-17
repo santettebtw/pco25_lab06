@@ -22,7 +22,11 @@ public:
     const SquareMatrix<T>* B;
     SquareMatrix<T>* C;
 
-    /* Maybe some parameters */
+	int blockI; // block row index in C matrix
+	int blockJ; // block column index in C matrix
+	int blockK; // block index for the sum
+	int blockSize; // (one dimension)
+	int jobId;
 };
 
 
@@ -32,7 +36,7 @@ public:
 /// Here we only wrote two potential methods, but there could be more at the end...
 ///
 template<class T>
-class Buffer
+class Buffer : public PcoHoareMonitor
 {
 public:
     int nbJobFinished{0}; // Keep this updated
@@ -42,16 +46,70 @@ public:
     /// \brief Sends a job to the buffer
     /// \param Reference to a ComputeParameters object which holds the necessary parameters to execute a job
     ///
-    void sendJob(ComputeParameters<T> params) {}
+    void sendJob(ComputeParameters<T> params) {
+		monitorIn();
+		jobs.push(params);
+		signal(jobAvailable);
+		monitorOut();
+	}
 
     ///
     /// \brief Requests a job to the buffer
     /// \param Reference to a ComputeParameters object which holds the necessary parameters to execute a job
     /// \return true if a job is available, false otherwise
     ///
-    bool getJob(ComputeParameters<T>& parameters) { return false; }
+    bool getJob(ComputeParameters<T>& parameters) { 
+		monitorIn();
+		while (jobs.empty() && !shouldTerminate) {
+			wait(jobAvailable);
+		}
 
-    /* Maybe more methods */
+		if(shouldTerminate && jobs.empty()) {
+			monitorOut();
+			return false;
+		}
+
+		parameters = jobs.front();
+		jobs.pop();
+		monitorOut();
+		return true;
+	}
+	
+	int registerComputation(int totalJobs) {
+		monitorIn();
+		int jobId = nextJobId++;
+		totalJobsExpected[jobId] = totalJobs;
+		jobCompletion[jobId] = 0;
+		monitorOut();
+		return jobId;
+	}
+
+	void notifyJobFinished(int jobId) {
+		monitorIn();
+		nbJobFinished++;
+		jobCompletion[jobId]++;
+		// check if all threads for this computation is done
+		if (jobCompletion[jobId] == totalJobsExpected[jobId]) {
+			signal(jobCompletionCond[jobId]);
+		}
+		monitorOut();
+	}
+
+	void waitForCompletion(int jobId) {
+		while (jobCompletion[jobId] < totalJobsExpected[jobId]) {
+		}
+	}
+
+private:
+	std::queue<ComputeParameters<T>> jobs;
+	Condition jobAvailable;
+
+	std::map<int, Condition> jobCompletionCond; // cond to wait on per job
+	std::map<int, int> totalJobsExpected; // expected jobs per job id
+	std::map<int, int> jobCompletion; // completed jobs per job id
+
+	int nextJobId = 0;
+	bool shouldTerminate = false;
 };
 
 
