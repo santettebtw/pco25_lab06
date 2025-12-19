@@ -1,6 +1,9 @@
 #ifndef THREADEDMATRIXMULTIPLIER_H
 #define THREADEDMATRIXMULTIPLIER_H
 
+#include <queue>
+#include <map>
+
 #include <pcosynchro/pcoconditionvariable.h>
 #include <pcosynchro/pcohoaremonitor.h>
 #include <pcosynchro/pcomutex.h>
@@ -75,29 +78,87 @@ public:
 		return true;
 	}
 	
+	///
+	/// \brief Registers a new computation and returns its job ID
+	/// \param totalJobs Total number of jobs for this computation
+	/// \return The job ID for this computation
+	///
 	int registerComputation(int totalJobs) {
 		monitorIn();
 		int jobId = nextJobId++;
 		totalJobsExpected[jobId] = totalJobs;
 		jobCompletion[jobId] = 0;
+		// Create condition variable for this jobId (will be created automatically by map access)
+		jobCompletionCond[jobId] = Condition();
 		monitorOut();
 		return jobId;
 	}
 
+	///
+	/// \brief Notifies that a job has been finished
+	/// \param jobId The ID of the computation this job belongs to
+	///
 	void notifyJobFinished(int jobId) {
 		monitorIn();
 		nbJobFinished++;
-		jobCompletion[jobId]++;
-		// check if all threads for this computation is done
-		if (jobCompletion[jobId] == totalJobsExpected[jobId]) {
-			signal(jobCompletionCond[jobId]);
+		
+		// Update per-jobId tracking
+		if (jobCompletion.find(jobId) != jobCompletion.end()) {
+			jobCompletion[jobId]++;
+			// Check if all jobs for this computation are done
+			if (jobCompletion[jobId] >= totalJobsExpected[jobId]) {
+				signal(jobCompletionCond[jobId]);
+			}
 		}
 		monitorOut();
 	}
 
+	///
+	/// \brief Waits for all jobs of a computation to finish
+	/// \param jobId The ID of the computation to wait for
+	///
 	void waitForCompletion(int jobId) {
+		monitorIn();
 		while (jobCompletion[jobId] < totalJobsExpected[jobId]) {
+			wait(jobCompletionCond[jobId]);
 		}
+		// Clean up tracking data
+		totalJobsExpected.erase(jobId);
+		jobCompletion.erase(jobId);
+		jobCompletionCond.erase(jobId);
+		monitorOut();
+	}
+	
+	///
+	/// \brief Resets the job counter for a new computation
+	///
+	void resetJobCounter() {
+		monitorIn();
+		nbJobFinished = 0;
+		monitorOut();
+	}
+	
+	///
+	/// \brief Signals all threads to terminate
+	///
+	void signalTermination() {
+		monitorIn();
+		shouldTerminate = true;
+		// Signal multiple times to wake all waiting threads
+		// (Hoare monitors don't have broadcast, so we signal many times)
+		for (int i = 0; i < 100; i++) {
+			signal(jobAvailable);
+		}
+		monitorOut();
+	}
+	
+	///
+	/// \brief Resets termination flag (for reentrancy)
+	///
+	void resetTermination() {
+		monitorIn();
+		shouldTerminate = false;
+		monitorOut();
 	}
 
 private:
@@ -120,6 +181,10 @@ private:
 template<class T>
 class ThreadedMatrixMultiplier : public AbstractMatrixMultiplier<T>
 {
+private:
+	template<class S>
+	void workerThreadFunction(ThreadedMatrixMultiplier<S>* multiplier) {
+	}
 
 public:
     ///
@@ -132,16 +197,10 @@ public:
     ThreadedMatrixMultiplier(int nbThreads, int nbBlocksPerRow = 0)
         : nbThreads(nbThreads), nbBlocksPerRow(nbBlocksPerRow)
     {
-        // TODO
-        for (int x = 0; x < nbThreads;++x) {
-            PcoThreads([this]{
-            while (!ThreadsStop) {
-
-                buf.getjob();
-
-            }
-            });
-        }
+		for (int i = 0; i < nbThreads; i++) {
+			PcoThread* thread = new PcoThread(workerThreadFunction<T>, this);
+			workerThreads.push_back(thread);
+		}
     }
 
     ///
@@ -195,6 +254,7 @@ public:
 protected:
     int nbThreads;
     int nbBlocksPerRow;
+	std::vector<PcoThread*> workerThreads;
     Buffer<T> buf;
     bool ThreadsStop = false;
 };
