@@ -86,15 +86,13 @@ public:
 	int registerComputation(int totalJobs) {
 		monitorIn();
 		int jobId = nextJobId++;
-		// Resize int vectors if needed
+		// Resize vector if needed
 		size_t neededSize = jobId + 1;
-		if (neededSize > totalJobsExpected.size()) {
+		if (neededSize > remainingJobs.size()) {
 			size_t newSize = neededSize * 2;
-			totalJobsExpected.resize(newSize);
-			jobCompletion.resize(newSize);
+			remainingJobs.resize(newSize);
 		}
-		totalJobsExpected[jobId] = totalJobs;
-		jobCompletion[jobId] = 0;
+		remainingJobs[jobId] = totalJobs;
 		monitorOut();
 		return jobId;
 	}
@@ -107,13 +105,12 @@ public:
 		monitorIn();
 		nbJobFinished++;
 		
-		// Update per-jobId tracking
+		// Decrement remaining jobs for this jobId
 		size_t idx = jobId;
-		if (idx < jobCompletion.size()) {
-			jobCompletion[jobId]++;
-			// Check if all jobs for this computation are done
-			if (jobCompletion[jobId] >= totalJobsExpected[jobId]) {
-				// Signal the single condition variable (all waiting threads will check their jobId)
+		if (idx < remainingJobs.size() && remainingJobs[jobId] > 0) {
+			remainingJobs[jobId]--;
+			// If all jobs are done, signal waiting threads
+			if (remainingJobs[jobId] == 0) {
 				signal(jobCompletionCond);
 			}
 		}
@@ -126,8 +123,8 @@ public:
 	///
 	void waitForCompletion(int jobId) {
 		monitorIn();
-		// Wait on single condition variable - may wake up for other jobIds, so check condition
-		while (jobCompletion[jobId] < totalJobsExpected[jobId]) {
+		// Wait until all jobs for this computation are done
+		while (remainingJobs[jobId] > 0) {
 			wait(jobCompletionCond);
 		}
 		monitorOut();
@@ -170,8 +167,7 @@ private:
 	Condition jobAvailable;
 
 	Condition jobCompletionCond; // condition variable for job completion
-	std::vector<int> totalJobsExpected; // expected jobs per job id
-	std::vector<int> jobCompletion; // completed jobs per job id
+	std::vector<int> remainingJobs; // remaining jobs per job id (decremented to 0)
 
 	int nextJobId = 0;
 	bool shouldTerminate = false;
