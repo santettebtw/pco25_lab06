@@ -33,21 +33,17 @@ public:
 };
 
 
-/// As a suggestion, a buffer class that could be used to communicate between
-/// the workers and the main thread...
-///
-/// Here we only wrote two potential methods, but there could be more at the end...
+/// Buffer class for job distribution using Hoare monitor
 ///
 template<class T>
 class Buffer : public PcoHoareMonitor
 {
 public:
-    int nbJobFinished{0}; // Keep this updated
-    /* Maybe some parameters */
+    int nbJobFinished{0};
 
     ///
-    /// \brief Sends a job to the buffer
-    /// \param Reference to a ComputeParameters object which holds the necessary parameters to execute a job
+    /// \brief sends a job to the buffer
+    /// \param params reference to a ComputeParameters object
     ///
     void sendJob(ComputeParameters<T> params) {
 		monitorIn();
@@ -57,8 +53,8 @@ public:
 	}
 
     ///
-    /// \brief Requests a job to the buffer
-    /// \param Reference to a ComputeParameters object which holds the necessary parameters to execute a job
+    /// \brief requests a job to the buffer
+    /// \param parameters reference to a ComputeParameters object
     /// \return true if a job is available, false otherwise
     ///
     bool getJob(ComputeParameters<T>& parameters) { 
@@ -79,14 +75,13 @@ public:
 	}
 	
 	///
-	/// \brief Registers a new computation and returns its job ID
-	/// \param totalJobs Total number of jobs for this computation
-	/// \return The job ID for this computation
+	/// \brief registers a new computation and returns its job ID
+	/// \param totalJobs the total number of jobs for this computation
+	/// \return the job ID for this computation
 	///
 	int registerComputation(int totalJobs) {
 		monitorIn();
 		int jobId = nextJobId++;
-		// Resize vector if needed
 		size_t neededSize = jobId + 1;
 		if (neededSize > remainingJobs.size()) {
 			size_t newSize = neededSize * 2;
@@ -98,18 +93,16 @@ public:
 	}
 
 	///
-	/// \brief Notifies that a job has been finished
-	/// \param jobId The ID of the computation this job belongs to
+	/// \brief notifies that a job has been finished
+	/// \param jobId the ID of the computation this job is from
 	///
 	void notifyJobFinished(int jobId) {
 		monitorIn();
 		nbJobFinished++;
 		
-		// Decrement remaining jobs for this jobId
 		size_t idx = jobId;
 		if (idx < remainingJobs.size() && remainingJobs[jobId] > 0) {
 			remainingJobs[jobId]--;
-			// If all jobs are done, signal waiting threads
 			if (remainingJobs[jobId] == 0) {
 				signal(jobCompletionCond);
 			}
@@ -118,12 +111,11 @@ public:
 	}
 
 	///
-	/// \brief Waits for all jobs of a computation to finish
-	/// \param jobId The ID of the computation to wait for
+	/// \brief waits for all jobs of a computation to finish
+	/// \param jobId the ID of the computation to wait for
 	///
 	void waitForCompletion(int jobId) {
 		monitorIn();
-		// Wait until all jobs for this computation are done
 		while (remainingJobs[jobId] > 0) {
 			wait(jobCompletionCond);
 		}
@@ -131,7 +123,7 @@ public:
 	}
 	
 	///
-	/// \brief Resets the job counter for a new computation
+	/// \brief resets the job counter for a new computation
 	///
 	void resetJobCounter() {
 		monitorIn();
@@ -140,13 +132,11 @@ public:
 	}
 	
 	///
-	/// \brief Signals all threads to terminate
+	/// \brief signal all threads to terminate
 	///
 	void signalTermination() {
 		monitorIn();
 		shouldTerminate = true;
-		// Signal multiple times to wake all waiting threads
-		// (Hoare monitors don't have broadcast, so we signal many times)
 		for (int i = 0; i < 100; i++) {
 			signal(jobAvailable);
 		}
@@ -154,7 +144,7 @@ public:
 	}
 	
 	///
-	/// \brief Resets termination flag (for reentrancy)
+	/// \brief resets termination flag (for reentering)
 	///
 	void resetTermination() {
 		monitorIn();
@@ -166,8 +156,8 @@ private:
 	std::queue<ComputeParameters<T>> jobs;
 	Condition jobAvailable;
 
-	Condition jobCompletionCond; // condition variable for job completion
-	std::vector<int> remainingJobs; // remaining jobs per job id (decremented to 0)
+	Condition jobCompletionCond;
+	std::vector<int> remainingJobs;
 
 	int nextJobId = 0;
 	bool shouldTerminate = false;
@@ -187,7 +177,7 @@ private:
 	static void workerThreadFunction(ThreadedMatrixMultiplier<S>* multiplier) {
 		ComputeParameters<S> params;
 		while(multiplier->buf.getJob(params)) {
-			// calcul limites des blocks
+			// calculate block boundaries
 			int startI = params.blockI * params.blockSize;
 			int endI = startI + params.blockSize;
 			int startJ = params.blockJ * params.blockSize;
@@ -195,15 +185,28 @@ private:
 			int startK = params.blockK * params.blockSize;
 			int endK = startK + params.blockSize;
 
+			// compute partial sum for this (i,j,k) block
+			// multiple k-blocks contribute to same C[i][j], so we batch updates
+			std::vector<std::vector<S>> partialSums(endI - startI, std::vector<S>(endJ - startJ, S(0)));
 			for (int i = startI; i < endI; i++) {
 				for (int j = startJ; j < endJ; j++) {
-					S partialSum = S(0);
 					for (int k = startK; k < endK; k++) {
-						partialSum += params.A->element(k, j) * params.B->element(i, k);
+						partialSums[i - startI][j - startJ] += params.A->element(k, j) * params.B->element(i, k);
 					}
-					params.C->setElement(i, j, params.C->element(i, j) + partialSum);
 				}
 			}
+			
+			// accumulate partial sums into result matric
+			// we need mutex here because multiple threads are going to write to
+			// the same result matrix
+			multiplier->resultMutex.lock();
+			for (int i = startI; i < endI; i++) {
+				for (int j = startJ; j < endJ; j++) {
+					S current = params.C->element(i, j);
+					params.C->setElement(i, j, current + partialSums[i - startI][j - startJ]);
+				}
+			}
+			multiplier->resultMutex.unlock();
 
 			multiplier->buf.notifyJobFinished(params.jobId);
 		}
@@ -233,10 +236,8 @@ public:
     ///
     ~ThreadedMatrixMultiplier()
     {
-        // Signaler la terminaison à tous les threads workers
         buf.signalTermination();
         
-        // Attendre que tous les threads se terminent et les supprimer
         for (size_t i = 0; i < workerThreads.size(); i++) {
             if (workerThreads[i]) {
                 workerThreads[i]->join();
@@ -245,7 +246,6 @@ public:
             }
         }
         
-        // Nettoyer le vecteur
         workerThreads.clear();
     }
 
@@ -277,6 +277,14 @@ public:
 		buf.resetTermination();
 
 		int blockSize = A.size() / nbBlocksPerRow;
+		
+		// initialize result matrix C to 0s to make sure it is empty
+		int matrixSize = A.size();
+		for (int i = 0; i < matrixSize; i++) {
+			for (int j = 0; j < matrixSize; j++) {
+				C.setElement(i, j, T(0));
+			}
+		}
 
     	int totalJobs = nbBlocksPerRow * nbBlocksPerRow * nbBlocksPerRow;
     	int jobId = buf.registerComputation(totalJobs);
@@ -306,6 +314,7 @@ protected:
     int nbBlocksPerRow;
 	std::vector<PcoThread*> workerThreads;
     Buffer<T> buf;
+    PcoMutex resultMutex;
 };
 
 

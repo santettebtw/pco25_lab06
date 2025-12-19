@@ -1,45 +1,82 @@
-# Rapport labo : Multiplication matricielle multithreadée par moniteurs
+# PCO: Rapport labo 6
 
-**Auteur :** Anthony Pfister, Santiago Sugranes  
-**Date :** 19.12.2025  
-**Cours :** PCO2025 lab06, HEIG
-
----
-
-## 1. Contexte et choix de conception
-
-Pour ce laboratoire, nous avons implémenté une multiplication matricielle multithreadée basée sur une décomposition en blocs.
-
-Les threads sont créés une seule fois dans le constructeur de `ThreadedMatrixMultiplier` et restent actifs pendant toute la durée de vie de l’objet.
-
-Le calcul est découpé en tâches correspondant aux triplets (i, j, k). Chaque tâche calcule une partie du résultat et est envoyée dans un buffer partagé.
-
-Le buffer est implémenté comme un moniteur de Hoare. Il permet de synchroniser l’accès aux jobs et de suivre l’avancement des calculs.
-
-Le thread principal ne fait aucun calcul directement et délègue tout le travail aux threads workers.
+**Auteur:** Anthony Pfister, Santiago Sugranes  
+**Date:** 19.12.2025  
+**Cours:** PCO2025 lab06, HEIG
 
 ---
 
-## 2. Analyse des problèmes de concurrence
+## Choix de conception
 
-L’accès concurrent au buffer de jobs est protégé par un moniteur de Hoare. Les threads attendent lorsqu’il n’y a pas de travail et sont réveillés lorsqu’un job est disponible.
+### Architecture: Modèle de délegation
 
-La matrice résultat est partagée entre les threads. Les écritures sont sûres car chaque job ajoute uniquement une somme partielle sur des indices déterminés.
+Les threads sont créés une seule fois dans le constructeur et restent actifs pendant toute la duré de vie de l'objet. Le thread principal délègue tout le travail aux threads workers via un buffer partagé.
 
-La fin d’un calcul est gérée par un compteur de jobs terminés. Le thread principal attend jusqu’à ce que tous les jobs soient complétés.
+**Justification:** évite le coût de création/destruction de threads à chaque appel à `multiply()`
 
-La terminaison des threads est gérée proprement dans le destructeur à l’aide d’un signal de terminaison.
+### Décomposition en blocs (i, j, k)
+
+Le calcul suit la formule de la donnée du labo avec une décomposition en (i, j, k):
+- chaque job calcule une contribution partielle `Aik * Bkj` pour un bloc k spécifique
+- plusieurs jobs (différents k) contribuent au même élément `C[i][j]`
+- nombre total de jobs : `nbBlocksPerRow³`
+
+**Justification:** respecte l'algorithme suggéré dans les instructions
+
+### Synchronisation: Moniteur de Hoare + Mutex
+
+**Buffer (moniteur de Hoare):** gère la distribution des jobs et le suivi de l'avancement par `jobId` pour la réentrance.
+
+**Mutex pour les écritures:** les écritures dans `C` sont protégés par `PcoMutex resultMutex` car plusieur threads écrivent dans le même `C[i][j]`. Les mises à jour sont groupées par bloc (tous les éléments d'un bloc dans une seule section critique).
+
+**Justification:** 
+- le moniteur assure la synchronisation thread-safe de la file de jobs
+- le mutex est nécessaire car plusieurs jobs contribuent au même élément de résultat
+- le groupement par bloc réduit le nombre d'acquisitions du mutex
 
 ---
 
-## 3. Tests effectués
+## Gestion de la réentrance
 
-Les tests fournis ont été utilisés pour vérifier la correction du calcul et la réentrance de la méthode `multiply`.
+Chaque appel à `multiply()` obtient un `jobId` unique via `registerComputation()`. Les threads signalent la fin de leurs jobs avec `notifyJobFinished(jobId)`, et le thread principal attend avec `waitForCompletion(jobId)` jusqu'à ce que tous les jobs de cette computation soient terminés.
 
-- CHECK_DURATION : marche mais assez lent #TODO
-- 
+**Justification:** permet à plusieurs appels à `multiply()` de s'executer concurremment sans problèmes
 
+## Terminaison des threads
 
-Tous les tests passent correctement et les résultats sont conformes aux attentes.
+Dans le destructeur:
+1. signal de terminaison envoyée à tous les threads (`signalTermination()`)
+2. attente de la fin de tous les threads (`join()`)
+3. libération de la mémoire
 
 ---
+
+## Tests effectués
+
+| Test | Matrice | Threads | Blocs | Appels concurrents | Performance | Temps |
+|------|---------|---------|-------|-------------------|-------------|-------|
+| SingleThread | 500×500 | 1 | 5 | 1 | -35.29% | 2309 ms |
+| Simple | 500×500 | 4 | 5 | 1 | +144.57% | 1290 ms |
+| Reentering | 500×500 | 4 | 5 | 2 | +141.96%, +25.84% | 1703 ms |
+| SmallMatrix | 100×100 | 2 | 4 | 1 | 0% | 23 ms |
+| ManyBlocks | 400×400 | 8 | 10 | 1 | +316.22% | 583 ms |
+| HighReentrancy | 300×300 | 4 | 6 | 4 | +132.14%, +22.22%, -14.29%, -35.33% | 585 ms |
+| SingleBlock | 200×200 | 4 | 1 | 1 | -36.67% | 152 ms |
+| FewBlocksManyThreads | 200×200 | 16 | 2 | 1 | +235.29% | 79 ms |
+| ExtremeReentrancy | 200×200 | 4 | 4 | 8 | +81.82% à -55.21% | 339 ms |
+
+Tous les tests passent sans erreur de calcul.
+
+---
+
+## Analyse des performances
+
+### Pourquoi certains tests sont plus lents ?
+
+**SingleThread (-35%):** overhead de synchronisation (moniteur, mutex) supérieur au bénéfice avec un seul thread.
+
+**SmallMatrix (0%):** matrice trop petite pour amortir le coût de synchronisation.
+
+**HighReentrancy / ExtremeReentrancy (performances négatives):** avec plusieurs calculs qui s'exécutent en même temps, tous les threads doivent attendre leur tour pour écrire dans la matrice résultat. Cette attente devient un goulot d'étranglement qui ralentit l'ensemble du traitement et annule les bénéfices du parallélisme.
+
+**Performances positives:** les cas avec matrices moyennes/grandes, plusieurs threads et blocs (Simple, ManyBlocks, FewBlocksManyThreads) ont des gains significatifs car le parallélisme compense largement l'overhead de synchronisation.
