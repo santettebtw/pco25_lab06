@@ -93,16 +93,6 @@ public:
 			totalJobsExpected.resize(newSize);
 			jobCompletion.resize(newSize);
 		}
-		// Reserve space for Condition vector and construct in place if needed
-		size_t jobIdSize = jobId;
-		if (jobIdSize >= jobCompletionCond.size()) {
-			size_t newSize = neededSize * 2;
-			jobCompletionCond.reserve(newSize);
-			// Construct new Condition objects in place
-			while (jobCompletionCond.size() <= jobIdSize) {
-				jobCompletionCond.emplace_back();
-			}
-		}
 		totalJobsExpected[jobId] = totalJobs;
 		jobCompletion[jobId] = 0;
 		monitorOut();
@@ -123,7 +113,8 @@ public:
 			jobCompletion[jobId]++;
 			// Check if all jobs for this computation are done
 			if (jobCompletion[jobId] >= totalJobsExpected[jobId]) {
-				signal(jobCompletionCond[jobId]);
+				// Signal the single condition variable (all waiting threads will check their jobId)
+				signal(jobCompletionCond);
 			}
 		}
 		monitorOut();
@@ -135,11 +126,10 @@ public:
 	///
 	void waitForCompletion(int jobId) {
 		monitorIn();
+		// Wait on single condition variable - may wake up for other jobIds, so check condition
 		while (jobCompletion[jobId] < totalJobsExpected[jobId]) {
-			wait(jobCompletionCond[jobId]);
+			wait(jobCompletionCond);
 		}
-		// Note: vector elements are left (will be cleaned up when vectors are destroyed)
-		// Since jobIds are always incremental and never reused, this is fine
 		monitorOut();
 	}
 	
@@ -179,7 +169,7 @@ private:
 	std::queue<ComputeParameters<T>> jobs;
 	Condition jobAvailable;
 
-	std::vector<Condition> jobCompletionCond; // cond to wait on per job
+	Condition jobCompletionCond; // condition variable for job completion
 	std::vector<int> totalJobsExpected; // expected jobs per job id
 	std::vector<int> jobCompletion; // completed jobs per job id
 
