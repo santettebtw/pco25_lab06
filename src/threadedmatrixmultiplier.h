@@ -2,7 +2,7 @@
 #define THREADEDMATRIXMULTIPLIER_H
 
 #include <queue>
-#include <map>
+#include <vector>
 
 #include <pcosynchro/pcoconditionvariable.h>
 #include <pcosynchro/pcohoaremonitor.h>
@@ -86,10 +86,25 @@ public:
 	int registerComputation(int totalJobs) {
 		monitorIn();
 		int jobId = nextJobId++;
+		// Resize int vectors if needed
+		size_t neededSize = jobId + 1;
+		if (neededSize > totalJobsExpected.size()) {
+			size_t newSize = neededSize * 2;
+			totalJobsExpected.resize(newSize);
+			jobCompletion.resize(newSize);
+		}
+		// Reserve space for Condition vector and construct in place if needed
+		size_t jobIdSize = jobId;
+		if (jobIdSize >= jobCompletionCond.size()) {
+			size_t newSize = neededSize * 2;
+			jobCompletionCond.reserve(newSize);
+			// Construct new Condition objects in place
+			while (jobCompletionCond.size() <= jobIdSize) {
+				jobCompletionCond.emplace_back();
+			}
+		}
 		totalJobsExpected[jobId] = totalJobs;
 		jobCompletion[jobId] = 0;
-		// Create condition variable for this jobId (will be created automatically by map access)
-		jobCompletionCond[jobId] = Condition();
 		monitorOut();
 		return jobId;
 	}
@@ -103,7 +118,8 @@ public:
 		nbJobFinished++;
 		
 		// Update per-jobId tracking
-		if (jobCompletion.find(jobId) != jobCompletion.end()) {
+		size_t idx = jobId;
+		if (idx < jobCompletion.size()) {
 			jobCompletion[jobId]++;
 			// Check if all jobs for this computation are done
 			if (jobCompletion[jobId] >= totalJobsExpected[jobId]) {
@@ -122,10 +138,8 @@ public:
 		while (jobCompletion[jobId] < totalJobsExpected[jobId]) {
 			wait(jobCompletionCond[jobId]);
 		}
-		// Clean up tracking data
-		totalJobsExpected.erase(jobId);
-		jobCompletion.erase(jobId);
-		jobCompletionCond.erase(jobId);
+		// Note: vector elements are left (will be cleaned up when vectors are destroyed)
+		// Since jobIds are always incremental and never reused, this is fine
 		monitorOut();
 	}
 	
@@ -165,9 +179,9 @@ private:
 	std::queue<ComputeParameters<T>> jobs;
 	Condition jobAvailable;
 
-	std::map<int, Condition> jobCompletionCond; // cond to wait on per job
-	std::map<int, int> totalJobsExpected; // expected jobs per job id
-	std::map<int, int> jobCompletion; // completed jobs per job id
+	std::vector<Condition> jobCompletionCond; // cond to wait on per job
+	std::vector<int> totalJobsExpected; // expected jobs per job id
+	std::vector<int> jobCompletion; // completed jobs per job id
 
 	int nextJobId = 0;
 	bool shouldTerminate = false;
@@ -182,8 +196,31 @@ template<class T>
 class ThreadedMatrixMultiplier : public AbstractMatrixMultiplier<T>
 {
 private:
+
 	template<class S>
-	void workerThreadFunction(ThreadedMatrixMultiplier<S>* multiplier) {
+	static void workerThreadFunction(ThreadedMatrixMultiplier<S>* multiplier) {
+		ComputeParameters<S> params;
+		while(multiplier->buf.getJob(params)) {
+			// calcul limites des blocks
+			int startI = params.blockI * params.blockSize;
+			int endI = startI + params.blockSize;
+			int startJ = params.blockJ * params.blockSize;
+			int endJ = startJ + params.blockSize;
+			int startK = params.blockK * params.blockSize;
+			int endK = startK + params.blockSize;
+
+			for (int i = startI; i < endI; i++) {
+				for (int j = startJ; j < endJ; j++) {
+					S partialSum = S(0);
+					for (int k = startK; k < endK; k++) {
+						partialSum += params.A->element(k, j) * params.B->element(i, k);
+					}
+					params.C->setElement(i, j, params.C->element(i, j) + partialSum);
+				}
+			}
+
+			multiplier->buf.notifyJobFinished(params.jobId);
+		}
 	}
 
 public:
@@ -210,8 +247,20 @@ public:
     ///
     ~ThreadedMatrixMultiplier()
     {
-        // TODO
-        ThreadsStop = true;
+        // Signaler la terminaison à tous les threads workers
+        buf.signalTermination();
+        
+        // Attendre que tous les threads se terminent et les supprimer
+        for (size_t i = 0; i < workerThreads.size(); i++) {
+            if (workerThreads[i]) {
+                workerThreads[i]->join();
+                delete workerThreads[i];
+                workerThreads[i] = nullptr;
+            }
+        }
+        
+        // Nettoyer le vecteur
+        workerThreads.clear();
     }
 
     ///
@@ -238,17 +287,32 @@ public:
     ///
     void multiply(const SquareMatrix<T>& A, const SquareMatrix<T>& B, SquareMatrix<T>& C, int nbBlocksPerRow)
     {
-        // OK, computation is done correctly, but... Is it really multithreaded?!?
-        // TODO : Get rid of the next lines and do something meaningful
-        for (int i = 0; i < A.size(); i++) {
-            for (int j = 0; j < A.size(); j++) {
-                T result = 0.0;
-                for (int k = 0; k < A.size(); k++) {
-                    result += A.element(k, j) * B.element(i, k);
-                }
-                C.setElement(i, j, result);
-            }
-        }
+		buf.resetJobCounter();
+		buf.resetTermination();
+
+		int blockSize = A.size() / nbBlocksPerRow;
+
+    	int totalJobs = nbBlocksPerRow * nbBlocksPerRow * nbBlocksPerRow;
+    	int jobId = buf.registerComputation(totalJobs);
+
+		for (int i = 0; i < nbBlocksPerRow; i++) {
+			for (int j = 0; j < nbBlocksPerRow; j++) {
+				for (int k = 0; k < nbBlocksPerRow; k++) {
+					ComputeParameters<T> params;
+					params.blockSize = blockSize;
+					params.blockI = i;
+					params.blockJ = j;
+					params.blockK = k;
+					params.A = &A;
+					params.B = &B;
+					params.C = &C;
+					params.jobId = jobId;
+					buf.sendJob(params);
+				}
+			}
+		}
+
+		buf.waitForCompletion(jobId);
     }
 
 protected:
@@ -256,7 +320,6 @@ protected:
     int nbBlocksPerRow;
 	std::vector<PcoThread*> workerThreads;
     Buffer<T> buf;
-    bool ThreadsStop = false;
 };
 
 
